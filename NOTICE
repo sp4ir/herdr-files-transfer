@@ -8,9 +8,12 @@ modified from the Herdr app's shipped `files` mod
 Changes in Files Transfer: a right-click menu on files and folders (download to
 ~/Downloads, paste/upload from Finder, copy path, reveal in Finder, new file,
 new folder, rename, move to Trash, delete with confirmation), Markdown and
-image previews, a hand-off to Preview Plus when paired, drag-and-drop upload, background transfers over scp for remote
-machines, English and Russian interface text, the install script, and the
-mod's renaming to files-transfer.
+image previews, a hand-off to Preview Plus when paired, drag-and-drop upload,
+background transfers over scp for remote machines, English and Russian
+interface text, the install script, and the mod's renaming to files-transfer.
+Windows and Linux support (PowerShell branches for every local step, a detached
+PowerShell transfer worker, Explorer / Recycle Bin / Ctrl+V wording, install.ps1)
+was added in the sp4ir fork.
 
 Icons in mods/files-transfer/icons/ come from Material Icon Theme
 (https://github.com/material-extensions/vscode-material-icon-theme), MIT.
