@@ -3,14 +3,16 @@
 // right-click menu that downloads, uploads (paste from Finder, or drop), copies paths, creates,
 // renames, moves to the Trash (here) or deletes (remote),
 // on this computer or on the remote machine the space runs on (over ssh).
+// This computer may run macOS, Windows or Linux: the desktop pieces (clipboard, file manager,
+// Trash, image tools, detached transfers) have a branch for each; remote machines always run sh.
 //
 // Based on File Icons by amster93 (https://github.com/amster93/herdr-file-icons, Apache-2.0),
 // itself modified from Herdr's shipped `files` mod (https://github.com/herdrdev/herdr-app,
 // Apache-2.0). Added here: the menu, transfers, create/rename/trash/delete, drop, previews,
-// English/Russian text.
+// English/Russian text, Windows and Linux support.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, TextView, InputState, Input } from "gpui-base";
-import { spaces, panes, focused, run, exec, readTextFile, watchFolder, theme, settings, window, props, openOverlay, closeOverlay, shared, setShared, notify, hc, appHome, home } from "herdr";
+import { spaces, panes, focused, run, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, props, openOverlay, closeOverlay, shared, setShared, notify, hc, appHome, home } from "herdr";
 import ICONS from "./icons.js";
 
 // Right-click menu on a file or folder: download it to ~/Downloads (scp from a remote
@@ -84,6 +86,209 @@ const out = [];
 if (urls) for (let i = 0; i < urls.count; i++) out.push(urls.objectAtIndex(i).path.js);
 JSON.stringify(out);`;
 
+// ---- This computer: sh on macOS and Linux, PowerShell on Windows. A remote machine (`on`)
+// always runs sh over ssh. Where a helper takes `on`, it acts there when given one.
+const platform = () => window()?.platform ?? "macos";
+const isWin = () => platform() === "windows";
+const isMac = () => platform() === "macos";
+// A PowerShell string literal, quoted the way Herdr quotes its own (single quotes doubled,
+// the curly ones too). Arguments reach a snippet through $a, never through its text.
+const psq = s => `'${String(s).replace(/['‘’‚‛]/g, "$&$&")}'`;
+function ps(script, args = [], options = {}) {
+  const cmd = `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $ErrorActionPreference = 'Stop'; & { param($a) ${script} } @(${args.map(psq).join(",")})`;
+  return exec("powershell", ["-NoProfile", "-NonInteractive", "-Command", cmd], options);
+}
+// Where transfers keep their status files, and on Windows the worker script and job files.
+const WORKERS = "data/files-transfer";
+
+// The Windows transfer worker, run detached (a hidden PowerShell) so a long copy isn't bound
+// by exec's 30 s. It reads its job from a JSON file and reports like FETCH/SEND do: the exit
+// code to <st>, scp's complaints to <st>.log, a download's final path to <st>.dest.
+const TRANSFER_PS = `param([string]$JobFile)
+$ErrorActionPreference = 'Stop'
+$j = Get-Content -LiteralPath $JobFile -Raw -Encoding UTF8 | ConvertFrom-Json
+$st = $j.st; $code = 1; $tmp = $null
+function Invoke-Scp($list, $log) {
+  $q = [char]34
+  $argv = @('-r', '-p', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15') + @($list | ForEach-Object { $q + $_ + $q })
+  $p = Start-Process -FilePath scp -ArgumentList $argv -NoNewWindow -Wait -PassThru -RedirectStandardError $log
+  return $p.ExitCode
+}
+try {
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $st)) | Out-Null
+  Remove-Item -LiteralPath $st, ($st + '.dest') -Force -ErrorAction SilentlyContinue
+  if ($j.kind -eq 'fetch') {
+    [IO.Directory]::CreateDirectory($j.dir) | Out-Null
+    $tmp = Join-Path $j.dir ('.herdr-download.' + [IO.Path]::GetRandomFileName().Replace('.', ''))
+    [IO.Directory]::CreateDirectory($tmp) | Out-Null
+    $target = Join-Path $tmp $j.name
+    if ($j.mode -eq 'scp') { $code = Invoke-Scp @($j.src, $target) ($st + '.log') }
+    else { Copy-Item -LiteralPath $j.src -Destination $target -Recurse -Force; $code = 0 }
+    if ($code -eq 0) {
+      $name = $j.name; $base = $name; $ext = ''
+      if ($j.isdir -ne '1' -and $name -match '^(.+)(\\.[^.]+)$') { $base = $Matches[1]; $ext = $Matches[2] }
+      $dest = Join-Path $j.dir $name; $i = 0
+      while (Test-Path -LiteralPath $dest) { $i++; $dest = Join-Path $j.dir ($base + ' (' + $i + ')' + $ext) }
+      Move-Item -LiteralPath $target -Destination $dest
+      [IO.File]::WriteAllText($st + '.dest', $dest)
+    }
+  } else {
+    if ($j.mode -eq 'scp') { $code = Invoke-Scp (@($j.files) + @($j.dest)) ($st + '.log') }
+    else { foreach ($f in @($j.files)) { Copy-Item -LiteralPath $f -Destination $j.dest -Recurse -Force }; $code = 0 }
+  }
+} catch {
+  $code = 1
+  try { [IO.File]::AppendAllText($st + '.log', [string]$_ + [Environment]::NewLine) } catch {}
+} finally {
+  if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+  [IO.File]::WriteAllText($st, [string]$code)
+  Remove-Item -LiteralPath $JobFile -Force -ErrorAction SilentlyContinue
+}
+`;
+
+// PLACE for this computer when it runs Windows.
+const PLACE_PS = `$tmp = $a[0]; $dir = $a[1]
+foreach ($p in @(Get-ChildItem -LiteralPath $tmp -Force)) {
+  $name = $p.Name; $base = $name; $ext = ''
+  $isdir = $p.PSIsContainer -and -not ($p.Attributes -band [IO.FileAttributes]::ReparsePoint)
+  if (-not $isdir -and $name -match '^(.+)(\\.[^.]+)$') { $base = $Matches[1]; $ext = $Matches[2] }
+  $dest = Join-Path $dir $name; $i = 0
+  while (Test-Path -LiteralPath $dest) { $i++; if ($isdir) { $dest = Join-Path $dir ($name + ' (' + $i + ')') } else { $dest = Join-Path $dir ($base + ' (' + $i + ')' + $ext) } }
+  Move-Item -LiteralPath $p.FullName -Destination $dest
+  Write-Output (Split-Path -Leaf $dest)
+}
+Remove-Item -LiteralPath $tmp -Recurse -Force`;
+
+// The Recycle Bin, through the shell's own move (Explorer's Restore works).
+const TRASH_PS = `Add-Type -AssemblyName Microsoft.VisualBasic
+$p = $a[0]
+if ((Get-Item -LiteralPath $p -Force).PSIsContainer) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin') }
+else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin') }`;
+
+// Starts the Windows worker on a job; the script is written beside the status files once.
+async function detach(job) {
+  const base = `${appHome()}/${WORKERS}`;
+  await mkdirp(base);
+  const ps1 = `${base}/transfer.ps1`, current = await readTextFile(ps1).catch(() => null);
+  if (current !== TRANSFER_PS) await writeTextFile(ps1, TRANSFER_PS, current);
+  const jobFile = `${job.st}.job`;
+  await writeTextFile(jobFile, JSON.stringify(job), null);
+  const r = await ps("$q = [char]34; Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ($q + $a[0] + $q), ($q + $a[1] + $q))", [ps1, jobFile]);
+  if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
+}
+
+// File operations here or on a machine. Each PowerShell form treats paths literally.
+function remove(path, on) {
+  if (on || !isWin()) return exec("rm", ["-rf", "--", path], { on });
+  return ps("if (Test-Path -LiteralPath $a[0]) { Remove-Item -LiteralPath $a[0] -Recurse -Force }", [path]);
+}
+function removeFiles(paths) {
+  if (!isWin()) return exec("rm", ["-f", ...paths]);
+  return ps("foreach ($p in $a) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }", paths);
+}
+function mkdirp(dir) {
+  return isWin() ? ps("[IO.Directory]::CreateDirectory($a[0]) | Out-Null", [dir]) : exec("mkdir", ["-p", dir]);
+}
+function move(from, to) {
+  return isWin() ? ps("Move-Item -LiteralPath $a[0] -Destination $a[1] -Force", [from, to]) : exec("mv", [from, to]);
+}
+function copy(from, to) {
+  return isWin() ? ps("Copy-Item -LiteralPath $a[0] -Destination $a[1] -Force", [from, to]) : exec("cp", [from, to]);
+}
+function fileSize(path, on) {
+  if (on || !isWin()) return exec("sh", ["-c", 'wc -c < "$1"', "size", path], { on });
+  return ps("(Get-Item -LiteralPath $a[0] -Force).Length", [path]);
+}
+// A fresh hidden folder inside dir for an upload; prints its path.
+function tempDir(dir, on) {
+  if (on || !isWin()) return exec("mktemp", ["-d", `${dir}/.herdr-upload.XXXXXX`], { on });
+  return ps("$d = Join-Path $a[0] ('.herdr-upload.' + [IO.Path]::GetRandomFileName().Replace('.', '')); [IO.Directory]::CreateDirectory($d) | Out-Null; Write-Output $d", [dir]);
+}
+// A new file or folder; exit 17 when the name is taken.
+function makeEntry(kind, target, on) {
+  if (on || !isWin()) return exec("sh", ["-c", kind === "file" ? MAKE_FILE : MAKE_FOLDER, "make", target], { on });
+  return ps(kind === "file"
+    ? "if (Test-Path -LiteralPath $a[0]) { exit 17 }; [IO.File]::Create($a[0]).Dispose()"
+    : "if (Test-Path -LiteralPath $a[0]) { exit 17 }; [IO.Directory]::CreateDirectory($a[0]) | Out-Null", [target]);
+}
+function rename(from, to, on) {
+  if (on || !isWin()) return exec("sh", ["-c", MOVE, "move", from, to], { on });
+  return ps("if (Test-Path -LiteralPath $a[1]) { exit 17 }; Move-Item -LiteralPath $a[0] -Destination $a[1]", [from, to]);
+}
+function place(tmp, dir, on) {
+  if (on || !isWin()) return exec("sh", ["-c", PLACE, "place", tmp, dir], { on });
+  return ps(PLACE_PS, [tmp, dir]);
+}
+
+// The desktop here: clipboard, file manager, Trash, image tools, language.
+const desktop = {
+  // Files copied in Finder / Explorer / the file manager: their paths.
+  async clipboardFiles() {
+    if (isMac()) {
+      const r = await exec("osascript", ["-l", "JavaScript", "-e", CLIPBOARD]);
+      return r.code === 0 ? JSON.parse(r.stdout.trim() || "[]") : [];
+    }
+    if (isWin()) {
+      const r = await ps("ConvertTo-Json -Compress -InputObject @(Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName })");
+      return r.code === 0 ? JSON.parse(r.stdout.trim() || "[]") : [];
+    }
+    const r = await exec("sh", ["-c", 'if command -v wl-paste >/dev/null 2>&1; then wl-paste -t text/uri-list 2>/dev/null; else xclip -selection clipboard -t text/uri-list -o 2>/dev/null; fi']).catch(() => null);
+    return (r?.stdout ?? "").split(/\r?\n/).filter(l => l.startsWith("file://")).map(l => decodeURIComponent(l.slice(7)));
+  },
+  copyText(text) {
+    if (isMac()) return exec("sh", ["-c", 'printf %s "$1" | pbcopy', "copy", text]);
+    if (isWin()) return ps("Set-Clipboard -Value $a[0]", [text]);
+    return exec("sh", ["-c", 'if command -v wl-copy >/dev/null 2>&1; then printf %s "$1" | wl-copy; else printf %s "$1" | xclip -selection clipboard; fi', "copy", text]);
+  },
+  reveal(path) {
+    if (isMac()) return exec("open", ["-R", path]);
+    if (isWin()) return ps("$q = [char]34; Start-Process explorer.exe -ArgumentList ('/select,' + $q + $a[0].Replace('/', '\\') + $q)", [path]);
+    return exec("xdg-open", [parentOf(path)]);
+  },
+  // In the default app (on macOS: Preview).
+  open(path) {
+    if (isMac()) return exec("open", ["-a", "Preview", path]);
+    if (isWin()) return ps("Start-Process -FilePath $a[0]", [path]);
+    return exec("xdg-open", [path]);
+  },
+  trash(path) {
+    if (isMac()) return exec("trash", [path]);
+    if (isWin()) return ps(TRASH_PS, [path]);
+    return exec("gio", ["trash", "--", path]);
+  },
+  // "ru" when the system speaks Russian, else "en".
+  async language() {
+    if (isMac()) {
+      const r = await exec("defaults", ["read", "-g", "AppleLanguages"]).catch(() => null);
+      return /^\W*"?ru/m.test(r?.stdout?.split("\n").find(l => /\w/.test(l) && !/^\s*\(/.test(l)) ?? "") ? "ru" : "en";
+    }
+    if (isWin()) {
+      const r = await ps("(Get-UICulture).Name").catch(() => null);
+      return /^ru/i.test(r?.stdout?.trim() ?? "") ? "ru" : "en";
+    }
+    const r = await exec("sh", ["-c", 'printf %s "${LC_ALL:-${LC_MESSAGES:-$LANG}}"']).catch(() => null);
+    return /^ru/i.test(r?.stdout ?? "") ? "ru" : "en";
+  },
+  // Makes the preview folder and drops copies older than an hour.
+  cleanPreviews(dir) {
+    if (isWin()) return ps("[IO.Directory]::CreateDirectory($a[0]) | Out-Null; Get-ChildItem -LiteralPath $a[0] -Force | Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } | Remove-Item -Recurse -Force", [dir]);
+    return exec("sh", ["-c", 'mkdir -p "$1" && find "$1" -mindepth 1 -mmin +60 -delete', "clean", dir]);
+  },
+  // An image as PNG (the formats GPUI can't draw). Windows reads what GDI+ reads (ICO, TIFF);
+  // HEIC and AVIF need codecs it doesn't have, so they fail and the panel says so.
+  toPng(file, png) {
+    if (isMac()) return exec("sips", ["-s", "format", "png", file, "--out", png]);
+    if (isWin()) return ps("Add-Type -AssemblyName System.Drawing; $i = [System.Drawing.Image]::FromFile($a[0]); try { $i.Save($a[1], [System.Drawing.Imaging.ImageFormat]::Png) } finally { $i.Dispose() }", [file, png]);
+    return exec("sh", ["-c", 'if command -v magick >/dev/null 2>&1; then magick "$1" "$2"; else convert "$1" "$2"; fi', "png", file, png]);
+  },
+  // Prints "pixelWidth: W" and "pixelHeight: H" lines, as sips does. A failure leaves them out.
+  dimensions(file) {
+    if (isMac()) return exec("sips", ["-g", "pixelWidth", "-g", "pixelHeight", file]);
+    if (isWin()) return ps("Add-Type -AssemblyName System.Drawing; $i = [System.Drawing.Image]::FromFile($a[0]); try { 'pixelWidth: ' + $i.Width; 'pixelHeight: ' + $i.Height } finally { $i.Dispose() }", [file]);
+    return exec("sh", ["-c", 'identify -format "pixelWidth: %w\\npixelHeight: %h" "$1"', "dims", file]);
+  },
+};
+
 // The ssh target behind a Herdr machine name (hc machine ls: "dev@host" or an ssh-config alias).
 async function sshTarget(machine) {
   const r = await hc(["machine", "ls", "--json"]);
@@ -92,7 +297,7 @@ async function sshTarget(machine) {
   return m.target;
 }
 
-// Interface text: Russian when macOS is set to Russian, else English (see init).
+// Interface text: Russian when the system is set to Russian, else English (see init).
 const STRINGS = {
   en: {
     pasteHere: "Paste here", pasteInto: "Paste into this folder", pasteBeside: "Paste here",
@@ -144,7 +349,35 @@ const STRINGS = {
     remoteDelete: "На этой машине нет Корзины: удаление навсегда.",
   },
 };
-const T = () => STRINGS[shared(LANG_KEY)] ?? STRINGS.en;
+// Words that name this computer's desktop: Finder is the default; Windows has Explorer and
+// the Recycle Bin; Linux a file manager.
+const DESKTOP = {
+  en: {
+    windows: {
+      reveal: "Show in Explorer", moveToTrash: "Move to Recycle Bin", openInPreview: "Open",
+      trashed: (n) => `Moved ${n} to the Recycle Bin`, trashFailed: (n) => `Couldn't move ${n} to the Recycle Bin`,
+      nothingToPasteBody: "Copy a file or folder in Explorer (Ctrl+C), then choose Paste.",
+      remoteDelete: "This machine has no Recycle Bin: it will be deleted permanently.",
+    },
+    linux: {
+      reveal: "Show in file manager", openInPreview: "Open",
+      nothingToPasteBody: "Copy a file or folder in your file manager (Ctrl+C), then choose Paste.",
+    },
+  },
+  ru: {
+    windows: {
+      reveal: "Показать в Проводнике", openInPreview: "Открыть",
+      nothingToPasteBody: "Скопируйте файл или папку в Проводнике (Ctrl+C), потом выберите «Вставить».",
+    },
+    linux: {
+      reveal: "Показать в файловом менеджере", openInPreview: "Открыть",
+      nothingToPasteBody: "Скопируйте файл или папку в файловом менеджере (Ctrl+C), потом выберите «Вставить».",
+    },
+  },
+};
+const T = () => { const lang = STRINGS[shared(LANG_KEY)] ? shared(LANG_KEY) : "en"; return { ...STRINGS[lang], ...(DESKTOP[lang][platform()] ?? {}) }; };
+// The paste key: ⌘V on a Mac, Ctrl+V elsewhere.
+const PASTE_KEY = () => isMac() ? "cmd-v" : "ctrl-v";
 
 // Previews: Markdown is drawn formatted (with a Source toggle); images are copied into the
 // app folder first, because image() only reads from there, and the formats GPUI can't draw
@@ -163,7 +396,13 @@ const PP_MARKDOWN = /\.(md|markdown)$/i;
 const PP_MEDIA = /\.(png|jpe?g|webp|svg|pdf)$/i;
 const bytesText = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1048576).toFixed(1)} MB`;
 
-const parentOf = path => path.slice(0, path.lastIndexOf("/")) || "/";
+// Paths join with "/" everywhere (Windows accepts both separators), but a Windows root
+// arrives with backslashes, so these read either.
+const parentOf = path => path.slice(0, Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))) || "/";
+const basename = path => path.split(/[\\/]/).pop();
+const norm = path => path.replace(/\\/g, "/");
+// Path components, without a Windows drive letter: "/home/x" and "C:\Users\x" are both 2 deep.
+const depth = path => path.split(/[\\/]/).filter(s => s && !/^[A-Za-z]:$/.test(s)).length;
 
 // A menu row is [action, label, icon]; null draws a divider.
 const MENU = (target, t = T()) => target.root
@@ -222,8 +461,8 @@ function icon(path, dir, open, dark) {
 }
 
 async function directory(path, on) {
-  if (!on && window()?.platform === "windows") {
-    const r = await exec("powershell", ["-NoProfile", "-Command", "& { param($p) @(Get-ChildItem -LiteralPath $p -Force -ErrorAction Stop | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name=$_.Name; dir=($_.PSIsContainer -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)) } }) | ConvertTo-Json -Compress }", path]);
+  if (!on && isWin()) {
+    const r = await ps("ConvertTo-Json -Compress -InputObject @(Get-ChildItem -LiteralPath $a[0] -Force | Where-Object Name -ne '.git' | Select-Object -First 501 | ForEach-Object { @{ name = $_.Name; dir = ($_.PSIsContainer -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)) } })", [path]);
     if (r.code !== 0) throw new Error(r.stderr || "Cannot list this folder");
     const result = JSON.parse(r.stdout || "[]");
     return Array.isArray(result) ? result : [result];
@@ -243,13 +482,12 @@ export default class Files extends View {
     // Which panel a menu choice is for: the one that opened the menu.
     this.me = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     this.jobs = [];
-    // ⌘V pastes into the selected row's folder: the panel takes the keyboard when clicked.
+    // ⌘V / Ctrl+V pastes into the selected row's folder: the panel takes the keyboard when clicked.
     this.keys = cx.focus_handle();
-    exec("sh", ["-c", 'mkdir -p "$1" && find "$1" -mindepth 1 -mmin +60 -delete', "clean", `${appHome()}/${PREVIEW_DIR}`]).catch(() => {});
+    desktop.cleanPreviews(`${appHome()}/${PREVIEW_DIR}`).catch(() => {});
     this.selected = null; // { path, dir } inside the shown folder
     cx.spawn(async cx => {
-      const r = await exec("defaults", ["read", "-g", "AppleLanguages"]).catch(() => null);
-      const lang = /^\W*"?ru/m.test(r?.stdout?.split("\n").find(l => /\w/.test(l) && !/^\s*\(/.test(l)) ?? "") ? "ru" : "en";
+      const lang = await desktop.language().catch(() => "en");
       if (shared(LANG_KEY) !== lang) setShared(LANG_KEY, lang);
     });
     cx.timer.every(1000, cx => this.poll(cx));
@@ -296,7 +534,7 @@ export default class Files extends View {
           const status = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=normal"], { cwd, on }).catch(() => null);
           if (status?.code === 0) for (const entry of status.stdout.split("\0").filter(Boolean).slice(0, TOTAL)) {
             const xy = entry.slice(0, 2);
-            marks[`${top.stdout.trim()}/${entry.slice(3)}`] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+            marks[norm(`${top.stdout.trim()}/${entry.slice(3)}`)] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
           }
         }
         if (key() !== context) return;
@@ -330,7 +568,7 @@ export default class Files extends View {
   show(path, cx) {
     this.code?.release(); this.code = null; this.file = path; this.fileError = null;
     this.md = null; this.source = false;
-    if (this.img) { exec("rm", ["-rf", parentOf(this.img.abs)]).catch(() => {}); this.img = null; }
+    if (this.img) { remove(parentOf(this.img.abs)).catch(() => {}); this.img = null; }
     if (!path || !cx) return;
     if (IMAGE.test(path)) return this.showImage(path, cx);
     const context = this.context, root = this.root, on = this.on;
@@ -353,17 +591,17 @@ export default class Files extends View {
 
   // A copy of src (on machine `on`) in this mod's preview folder, here; its absolute path.
   async stage(src, on) {
-    const size = await exec("sh", ["-c", 'wc -c < "$1"', "size", src], { on });
+    const size = await fileSize(src, on);
     if (size.code !== 0) throw new Error((size.stderr || T().imageFailed).trim());
     const bytes = Number(size.stdout.trim());
     if (bytes > MAX_IMAGE) throw new Error(T().imageTooBig(bytesText(bytes)));
     const dir = `${appHome()}/${PREVIEW_DIR}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-    await exec("mkdir", ["-p", dir]);
-    const file = `${dir}/${src.split("/").pop()}`;
-    const copy = on
+    await mkdirp(dir);
+    const file = `${dir}/${basename(src)}`;
+    const copied = on
       ? await exec("scp", ["-p", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", `${await sshTarget(on)}:${src}`, file])
-      : await exec("cp", [src, file]);
-    if (copy.code !== 0) { await exec("rm", ["-rf", dir]).catch(() => {}); throw new Error((copy.stderr || T().imageFailed).trim()); }
+      : await copy(src, file);
+    if (copied.code !== 0) { await remove(dir).catch(() => {}); throw new Error((copied.stderr || T().imageFailed).trim()); }
     return { file, bytes };
   }
 
@@ -387,7 +625,7 @@ export default class Files extends View {
   }
 
   // An image: copied into the app folder (scp from a remote machine), converted when GPUI
-  // can't draw its format, measured with sips, then drawn fitted to the panel.
+  // can't draw its format, measured (sips, GDI+ or ImageMagick), then drawn fitted to the panel.
   showImage(path, cx) {
     const context = this.context, root = this.root, on = this.on ?? null, src = `${root}/${path}`;
     const ext = path.split(".").pop().toLowerCase(), id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -396,24 +634,24 @@ export default class Files extends View {
       try {
         const staged = await this.stage(src, on), dir = parentOf(staged.file), bytes = staged.bytes;
         file = `${dir}/${id}.${ext}`;
-        await exec("mv", [staged.file, file]);
+        await move(staged.file, file);
         if (CONVERT.test(path)) {
           const png = `${dir}/${id}.png`;
-          const c = await exec("sips", ["-s", "format", "png", file, "--out", png]);
-          await exec("rm", ["-f", file]);
+          const c = await desktop.toPng(file, png);
+          await removeFiles([file]);
           file = png;
           if (c.code !== 0) throw new Error(T().imageFailed);
         }
         let w = null, h = null;
         if (ext !== "svg") {
-          const d = await exec("sips", ["-g", "pixelWidth", "-g", "pixelHeight", file]);
+          const d = await desktop.dimensions(file).catch(() => ({ stdout: "" }));
           w = Number(d.stdout.match(/pixelWidth:\s*(\d+)/)?.[1]) || null;
           h = Number(d.stdout.match(/pixelHeight:\s*(\d+)/)?.[1]) || null;
         }
-        if (this.file !== path || key() !== context) { await exec("rm", ["-rf", parentOf(file)]); return; }
-        this.img = { rel: file.slice(appHome().length + 1), abs: file, local: on ? null : src, w, h, bytes };
+        if (this.file !== path || key() !== context) { await remove(parentOf(file)); return; }
+        this.img = { rel: norm(file.slice(appHome().length + 1)), abs: file, local: on ? null : src, w, h, bytes };
       } catch (e) {
-        if (file) exec("rm", ["-rf", parentOf(file)]).catch(() => {});
+        if (file) remove(parentOf(file)).catch(() => {});
         if (this.file === path && key() === context) this.fileError = String(e.message ?? e);
       } finally { cx.notify(); }
     });
@@ -433,7 +671,7 @@ export default class Files extends View {
           .child(div().flex_1().min_w(0).truncate().child(info))
           .child(div().id("files-open-preview").px(8).py(3).rounded(6).cursor_pointer().text_color(t.muted)
             .hover(s => s.bg(t.hover).text_color(t.foreground))
-            .on_click(() => exec("open", ["-a", "Preview", img.local ?? img.abs]).catch(() => {}))
+            .on_click(() => desktop.open(img.local ?? img.abs).catch(() => {}))
             .child(T().openInPreview)));
     }
     if (this.md !== null && !this.source) {
@@ -448,7 +686,7 @@ export default class Files extends View {
   openMenu(path, dir) {
     const target = path
       ? { path: `${this.root}/${path}`, name: path.split("/").pop(), dir, on: this.on ?? null, from: this.me }
-      : { path: this.root, name: this.root.split("/").pop(), dir: true, root: true, on: this.on ?? null, from: this.me };
+      : { path: this.root, name: basename(this.root), dir: true, root: true, on: this.on ?? null, from: this.me };
     openOverlay({ mod: "files-transfer", kind: "popup", width: 250, height: menuHeight(MENU(target)), props: { menu: target } });
   }
 
@@ -473,24 +711,25 @@ export default class Files extends View {
     cx.spawn(async cx => {
       try {
         if (action === "copy") {
-          await exec("sh", ["-c", 'printf %s "$1" | pbcopy', "copy", path]);
+          const r = await desktop.copyText(path);
+          if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().pathCopied, body: path, level: "info", timeout: 2500 });
         } else if (action === "reveal") {
-          await exec("open", ["-R", path]);
+          await desktop.reveal(path);
         } else if (action === "download") {
           await this.download(path, name, dir, on);
         } else if (action === "paste") {
           await this.paste(dir ? path : parentOf(path), on);
         } else if (action === "trash") {
-          if (on || path === this.root || path.split("/").filter(Boolean).length < 2) throw new Error(T().tooDangerous(path));
-          const r = await exec("trash", [path]);
+          if (on || path === this.root || depth(path) < 2) throw new Error(T().tooDangerous(path));
+          const r = await desktop.trash(path);
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().trashed(name), body: path.replace(home(), "~"), level: "success", timeout: 4000 });
           if (this.file && `${this.root}/${this.file}`.startsWith(path)) this.show(null);
           this.refresh(cx);
         } else if (action === "create-file" || action === "create-folder") {
           const target = `${req.folder}/${req.value}`;
-          const r = await exec("sh", ["-c", action === "create-file" ? MAKE_FILE : MAKE_FOLDER, "make", target], { on });
+          const r = await makeEntry(action === "create-file" ? "file" : "folder", target, on);
           if (r.code === 17) throw new Error(T().exists(req.value));
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().created(req.value), body: on ? `${on}:${target}` : target.replace(home(), "~"), level: "success", timeout: 3000 });
@@ -499,7 +738,7 @@ export default class Files extends View {
         } else if (action === "rename-yes") {
           const target = `${parentOf(path)}/${req.value}`;
           if (target === path) return;
-          const r = await exec("sh", ["-c", MOVE, "move", path, target], { on });
+          const r = await rename(path, target, on);
           if (r.code === 17) throw new Error(T().exists(req.value));
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().renamed(name, req.value), body: on ? `${on}:${target}` : target.replace(home(), "~"), level: "success", timeout: 3000 });
@@ -508,8 +747,8 @@ export default class Files extends View {
           this.refresh(cx);
         } else if (action === "delete-yes") {
           // Never the shown folder itself, the home folder or a root-level path.
-          if (path === this.root || path.split("/").filter(Boolean).length < 2) throw new Error(T().tooDangerous(path));
-          const r = await exec("rm", ["-rf", "--", path], { on });
+          if (path === this.root || depth(path) < 2) throw new Error(T().tooDangerous(path));
+          const r = await remove(path, on);
           if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
           notify({ title: T().deleted(name), body: on ? `${on}:${path}` : path, level: "success", timeout: 4000 });
           if (this.file && `${this.root}/${this.file}`.startsWith(path)) this.show(null);
@@ -525,15 +764,14 @@ export default class Files extends View {
     });
   }
 
-  // Files copied in Finder, uploaded into folder (absolute, on the machine `on`).
+  // Files copied in Finder / Explorer, uploaded into folder (absolute, on the machine `on`).
   async paste(folder, on) {
-    const r = await exec("osascript", ["-l", "JavaScript", "-e", CLIPBOARD]);
-    const files = r.code === 0 ? JSON.parse(r.stdout.trim() || "[]") : [];
+    const files = await desktop.clipboardFiles();
     if (!files.length) return notify({ title: T().nothingToPaste, body: T().nothingToPasteBody, level: "warning", timeout: 5000 });
     await this.upload(files, folder, on);
   }
 
-  // ⌘V: into the selected folder, beside the selected file, else into the shown folder.
+  // ⌘V / Ctrl+V: into the selected folder, beside the selected file, else into the shown folder.
   pasteKey(cx) {
     if (!this.root) return;
     const sel = this.selected;
@@ -556,26 +794,36 @@ export default class Files extends View {
 
   async download(path, name, dir, on) {
     const src = on ? `${await sshTarget(on)}:${path}` : path;
-    const status = `${appHome()}/data/files-transfer/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const r = await exec("sh", ["-c", FETCH, "fetch", src, `${home()}/Downloads`, name, status, on ? "scp" : "cp", dir ? "1" : "0"]);
-    if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
+    const status = `${appHome()}/${WORKERS}/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const downloads = `${home()}/Downloads`, mode = on ? "scp" : "cp", isdir = dir ? "1" : "0";
+    if (isWin()) await detach({ kind: "fetch", st: status, src, dir: downloads, name, mode, isdir });
+    else {
+      const r = await exec("sh", ["-c", FETCH, "fetch", src, downloads, name, status, mode, isdir]);
+      if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
+    }
     this.jobs.push({ kind: "download", status, name });
   }
 
   // Local files into dir on the shown folder's machine: into a temporary folder there
   // first, then into place under free names (PLACE), so nothing is overwritten.
   async upload(files, dir, on) {
-    const mk = await exec("mktemp", ["-d", `${dir}/.herdr-upload.XXXXXX`], { on });
+    const mk = await tempDir(dir, on);
     if (mk.code !== 0) throw new Error((mk.stderr || `exit ${mk.code}`).trim());
     const tmp = mk.stdout.trim();
     const dest = on ? `${await sshTarget(on)}:${tmp}/` : `${tmp}/`;
-    const status = `${appHome()}/data/files-transfer/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const r = await exec("sh", ["-c", SEND, "send", status, on ? "scp" : "cp", dest, ...files]);
-    if (r.code !== 0) {
-      await exec("rm", ["-rf", "--", tmp], { on }).catch(() => {});
-      throw new Error((r.stderr || `exit ${r.code}`).trim());
+    const status = `${appHome()}/${WORKERS}/${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const mode = on ? "scp" : "cp";
+    try {
+      if (isWin()) await detach({ kind: "send", st: status, mode, dest, files });
+      else {
+        const r = await exec("sh", ["-c", SEND, "send", status, mode, dest, ...files]);
+        if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
+      }
+    } catch (e) {
+      await remove(tmp, on).catch(() => {});
+      throw e;
     }
-    const name = files.length === 1 ? files[0].split("/").pop() : T().items(files.length);
+    const name = files.length === 1 ? basename(files[0]) : T().items(files.length);
     this.jobs.push({ kind: "upload", status, name, tmp, dir, on });
   }
 
@@ -594,29 +842,29 @@ export default class Files extends View {
         const fail = log?.split("\n").pop() || T().code(code.trim());
         if (job.kind === "download") {
           const dest = (await readTextFile(`${job.status}.dest`).catch(() => null)) || `${home()}/Downloads/${job.name}`;
-          if (ok) notify({ title: T().downloaded(dest.split("/").pop()), body: dest.replace(home(), "~"), level: "success", timeout: 6000 });
+          if (ok) notify({ title: T().downloaded(basename(dest)), body: dest.replace(home(), "~"), level: "success", timeout: 6000 });
           else notify({ title: T().downloadFailed(job.name), body: fail, level: "error" });
         } else {
           try {
             if (!ok) throw new Error(fail);
-            const r = await exec("sh", ["-c", PLACE, "place", job.tmp, job.dir], { on: job.on });
+            const r = await place(job.tmp, job.dir, job.on);
             if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim());
-            const names = r.stdout.trim().split("\n").filter(Boolean);
+            const names = r.stdout.trim().split(/\r?\n/).filter(Boolean);
             notify({ title: T().uploaded(names.length === 1 ? names[0] : T().items(names.length)),
               body: job.on ? `${job.on}:${job.dir}` : job.dir.replace(home(), "~"), level: "success", timeout: 6000 });
           } catch (e) {
             notify({ title: T().uploadFailed(job.name), body: String(e.message ?? e), level: "error" });
           }
-          await exec("rm", ["-rf", "--", job.tmp], { on: job.on }).catch(() => {});
+          await remove(job.tmp, job.on).catch(() => {});
           this.refresh(cx);
         }
-        await exec("rm", ["-f", job.status, `${job.status}.log`, `${job.status}.dest`]).catch(() => {});
+        await removeFiles([job.status, `${job.status}.log`, `${job.status}.dest`]).catch(() => {});
       }
       if (changed) cx.notify();
     });
   }
 
-  // Files dragged in from Finder: uploaded into dir (a folder inside the shown one, "" for it).
+  // Files dragged in from Finder / Explorer: uploaded into dir (a folder inside the shown one, "" for it).
   drop(paths, dir, cx) {
     if (!paths?.length || !this.root) return;
     const target = dir ? `${this.root}/${dir}` : this.root, on = this.on ?? null;
@@ -729,7 +977,7 @@ export default class Files extends View {
     if (out.length >= TOTAL || depth > 40) return out;
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[norm(`${this.root}/${path}`)];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
         .when(this.selected?.path === path, el => el.bg(t.selected)).hover(s => s.bg(t.hover))
         .on_click((_e, cx) => { this.select(path, entry.dir); entry.dir ? this.toggle(path, cx) : this.handoff(path, cx) || this.show(path, cx); })
@@ -753,7 +1001,7 @@ export default class Files extends View {
     const t = theme(), dark = Boolean(settings().dark);
     return v_flex().id("files").track_focus(this.keys).size_full().min_h(0)
       .on_key_down((e, cx) => {
-        if (e.keystroke === "cmd-v") { cx.stop_propagation(); this.pasteKey(cx); }
+        if (e.keystroke === PASTE_KEY()) { cx.stop_propagation(); this.pasteKey(cx); }
         else if (e.keystroke === "escape" && this.selected) { cx.stop_propagation(); this.selected = null; cx.notify(); }
       })
       // Sizes arrive in window points; element sizes are given at zoom 1.
